@@ -167,3 +167,23 @@ def send_buttons(packer, count, send_cruise):
   return packer.make_can_msg("ACC_BUTTONS", 0, values)
 
 init_lut_crc8_8h2f()
+
+def create_steering_torque_spoof(packer, stock):
+  """Spoof the STEERING_TORQUE message so the stock EPS module sees a nonzero
+  hands-on torque while bukapilot is actively steering (ICC-only lateral),
+  preventing a false hands-on-wheel warning/disengage.
+
+  Sent on bus 2 (unlike this file's other TX messages, which are bus 0):
+  STEERING_TORQUE flows car (bus 0) -> bus 2, the opposite direction from
+  ADAS_LKAS/ACC_BUTTONS, so the spoof must be injected on bus 2 to reach
+  the same audience the real message would have -- matching the reference
+  fix in kommuai/opendbc@001dda2a. The real message must also be blocked
+  from crossing bus 0 -> bus 2 for a few frames when this is sent, or the
+  device and the real signal will both reach bus 2 and the spoof has no
+  effect -- see safety_proton.h's proton_tq_tx_block_frames."""
+  values = {**stock, "MAIN_TORQUE": 125}
+  dat = packer.make_can_msg("STEERING_TORQUE", 2, values)[2]
+  values["CHECKSUM"] = get_crc8_8h2f(dat[:-1])
+
+  return packer.make_can_msg("STEERING_TORQUE", 2, values)
+
