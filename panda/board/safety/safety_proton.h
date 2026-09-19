@@ -1,16 +1,27 @@
 // Ported from upstream kommuai/bukapilot:release_ka2 (panda/board/safety/safety_proton.h),
 // adapted for KA1: this branch's Proton python controller (selfdrive/car/proton/*) transmits
-// everything on a single bus (bus 0) -- there is no bus-0/bus-2 split like release_ka2's harness,
-// so ACC_BUTTONS is listed on bus 0 here (release_ka2 has it on bus 2) and the STEERING_TORQUE
-// entry (336) has been added for the ICC-only lateral torque-spoof fix.
+// ADAS_LKAS/ACC_BUTTONS on bus 0 -- there is no bus split needed for those, matching
+// release_ka2's LKAS assignment but not its ACC_BUTTONS (which release_ka2 has on bus 2).
 //
-// NOTE: this is a draft port, unverified on real hardware. release_ka2's proton_tx_hook is
-// permissive (no per-message content validation, address/bus/length allowlist only via
-// PROTON_TX_MSGS). Whether KA1's harness can actually suppress the real STEERING_TORQUE
-// broadcast the way release_ka2's proton_fwd_hook suppresses LKAS/ACC on its bus-2 segment is
-// still unconfirmed -- see PR description.
-const CanMsg PROTON_TX_MSGS[] = {{432, 0, 8}, {643, 0, 8}, {336, 0, 8}};
+// STEERING_TORQUE (336) is the exception: it flows car (bus 0) -> bus 2, the opposite
+// direction from ADAS_LKAS/ACC_BUTTONS, so the device's spoofed replacement is sent on
+// bus 2 (see selfdrive/car/proton/protoncan.py:create_steering_torque_spoof) and the real
+// broadcast must be blocked from crossing bus 0 -> bus 2 for a few frames whenever the
+// spoof is sent, exactly like the ADAS_LKAS/ACC_CMD block-on-bus-2 pattern below but in
+// the opposite direction. Per maintainer guidance (2026-09-19): block for exactly 3 frames
+// -- 1 frame causes stock-value flicker, always-blocking causes an ADAS error on the car.
+// This mirrors kommuai/opendbc@001dda2a's proton_tq_tx_block_frames/PROTON_ACC_TX_BLOCK_MAX
+// pattern for the newer opendbc.car.proton architecture.
+//
+// UNVERIFIED on real KA1 hardware: maintainer confirmed KA1/KA2 share the same relay
+// connector/cable, but was not sure whether the panda board itself behaves identically
+// device-side. Needs on-vehicle testing after a firmware rebuild+reflash.
+const CanMsg PROTON_TX_MSGS[] = {{432, 0, 8}, {643, 0, 8}, {336, 2, 8}};
 bool using_stock_acc = false;
+
+#define PROTON_STEERING_TORQUE 336
+#define PROTON_TQ_TX_BLOCK_MAX 3U
+static uint8_t proton_tq_tx_block_frames = 0U;
 
 RxCheck proton_rx_checks[] = {
 };
@@ -26,8 +37,11 @@ static bool proton_tx_hook(const CANPacket_t *to_send) {
   bool tx = true;
   int addr = GET_ADDR(to_send);
   int len = GET_LEN(to_send);
-  UNUSED(addr);
   UNUSED(len);
+
+  if (addr == PROTON_STEERING_TORQUE) {
+    proton_tq_tx_block_frames = PROTON_TQ_TX_BLOCK_MAX;
+  }
 
   return tx;
 }
@@ -35,7 +49,11 @@ static bool proton_tx_hook(const CANPacket_t *to_send) {
 static int proton_fwd_hook(int bus_num, int addr) {
   int bus_fwd = -1;
   if (bus_num == 0) {
-    bus_fwd = 2;
+    bool is_tq_msg = (addr == PROTON_STEERING_TORQUE) && (proton_tq_tx_block_frames > 0U);
+    if (is_tq_msg) {
+      proton_tq_tx_block_frames--;
+    }
+    bus_fwd = is_tq_msg ? -1 : 2;
   }
 
   if (bus_num == 2) {
@@ -52,6 +70,7 @@ static int proton_fwd_hook(int bus_num, int addr) {
 
 static safety_config proton_init(uint16_t param) {
   if (param == 2) using_stock_acc = true;
+  proton_tq_tx_block_frames = 0U;
   return BUILD_SAFETY_CFG(proton_rx_checks, PROTON_TX_MSGS);
 }
 
